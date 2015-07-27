@@ -499,7 +499,10 @@ template <typename Drv> template <typename ReplyFunc> void State<Drv>::execute(g
         float j = cmd.getJ();
         float k = cmd.getK();
         Vector3f center = coordToPrimitive(Vector4f(i, j, k, 0)).xyz();
-        center = center.withZ(cmd.hasK() ? center.z() : curZ);
+
+        // if the center z is not explicitly set, make it the midpoint between current z and end z
+        center = center.withZ(cmd.hasK() ? center.z() : 0.5f*(curZ+trueDest.z()));
+
         this->queueArc(trueDest, center, cmd.isG2());
         reply(gparse::Response::Ok);
     } else if (cmd.isG20()) { //g-code coordinates will now be interpreted as inches
@@ -612,11 +615,11 @@ template <typename Drv> template <typename ReplyFunc> void State<Drv>::execute(g
         if (cmd.isM107()) {
             LOGW("M107 is deprecated. Use M106 with S=0 instead.\n");
         }
-        float s = cmd.isM107() ? 0.0 : cmd.getS(1.0); //PWM duty cycle
-        if (s > 1) { //host thinks we're working from 0 to 255
-            s = s/256.0; //TODO: move this logic into cmd.getSNorm()
-        }
+
+        float s = cmd.isM107() ? 0.0f : cmd.getNormalizedS(1.0f); //PWM duty cycle
+
         if (cmd.hasP()) {
+            // set only the speed of the fan at the specified index, 'P'
             int index = cmd.getP();
             if (index >= 0 && (unsigned)index < ioDrivers.fans().length()) {
                 this->ioDrivers.fans()[index].setFanDutyCycle(s);
@@ -624,6 +627,7 @@ template <typename Drv> template <typename ReplyFunc> void State<Drv>::execute(g
                 reply(gparse::Response(gparse::ResponseWarning, "Invalid fan index"));
             }
         } else {
+            // set the speed of ALL fans to 's'
             this->ioDrivers.setFanDutyCycle(s);
         }
         reply(gparse::Response::Ok);
@@ -640,9 +644,10 @@ template <typename Drv> template <typename ReplyFunc> void State<Drv>::execute(g
         LOGW("(state.h): OP_M110 (set current line number) not implemented\n");
         reply(gparse::Response::Ok);
     } else if (cmd.isM111()) {
-        //set debug info.
-        //the S parameter is a bitfield indicating log level. bit 0 = verbose, bit 1 = debug, bit 2 = info+errors
-        int bitfield = cmd.getS();
+        // set debug info.
+        // the S parameter is a bitfield indicating the log levels to enable. bit 0 = verbose, bit 1 = debug, bit 2 = info+errors
+        // e.g. S3 = 0b011 = enable verbose + debug logging, but not info/errors.
+        int bitfield = cmd.getS(0);
         logging::enableVerbose(bitfield & 1);
         logging::enableDebug(bitfield & 2);
         logging::enableInfo(bitfield & 4);
@@ -651,10 +656,14 @@ template <typename Drv> template <typename ReplyFunc> void State<Drv>::execute(g
         reply(gparse::Response::Ok);
         exit(1);
     } else if (cmd.isM115()) {
-        //get firmware info
+        // get firmware info
+        // if you derive from Printipi and reimplement this method to show the name of your firmware,
+        //   please consider adding "(based on printipi)"
+        // this will aid hosts that tailore their communications based on the detected firmware
+        // and will also help track the evolution of the software.
         reply(gparse::Response(gparse::ResponseOk, {
             std::make_pair("FIRMWARE_NAME", "printipi"),
-            std::make_pair("FIRMWARE_URL", "github.com/Wallacoloo/printipi")
+            std::make_pair("FIRMWARE_URL", "https%3A//github.com/Wallacoloo/printipi")
         }));
     } else if (cmd.isM116()) { //Wait for all heaters (and slow moving variables) to reach target
         _isWaitingForHotend = true;
@@ -735,12 +744,13 @@ template <typename Drv> void State<Drv>::homeEndstops() {
 
 template <typename Drv> bool State<Drv>::areHeatersReady() {
     if (_isWaitingForHotend) {
-        return ioDrivers.heaters().all([](typename IODriverTypes::iteratorbase &d) {
+        // check if ALL heaters have reached their targets
+        bool isReady = ioDrivers.heaters().all([](typename IODriverTypes::iteratorbase &d) {
             return d.getMeasuredTemperature() > d.getTargetTemperature();
         });
-    } else {
-        return true;
+        _isWaitingForHotend = !isReady;
     }
+    return !_isWaitingForHotend;
 }
 
 template <typename Drv> std::string State<Drv>::getEndstopStatusString() {

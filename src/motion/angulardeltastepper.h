@@ -70,6 +70,20 @@
  * Move to one side:
  *   -(F1y-E1'y)cos(a) - (F1z-E1'z)sin(a) - 1/2rf*(re^2-E1x^2 - rf^2 - |F1-E1'|^2) == 0
  *
+ * Note: given F1x = 0, E1'x = 0, E1'y = E1y, E1'z = E1z, then the following relation holds:
+ *     E1x^2 + |F1-E1'|^2 = E1x^2 + (F1y-E1y)^2 + (F1z-E1z)^2
+ *                        = (F1x-E1x)^2 + (F1y-E1y)^2 + (F1z-E1z)^2
+ *                        = |F1-E1|^2
+ * Therefore:
+ *   -(F1y-E1y)cos(a) - (F1z-E1z)sin(a) - 1/(2rf)*(re^2 - rf^2 - |F1-E1|^2) == 0
+ * Also, -(F1y-E1y)cos(a) - (F1z-E1z)sin(a) = (F1-E1) . (0, cos(a), sin(a))
+ * So
+ *   -(F1-E1) . (0, cos(a), sin(a)) - 1/(2rf)*(re^2 - rf^2 - |F1-E1|^2) == 0
+ * Multiply by 2rf and negate:
+ *   2rf*(F1-E1) . (0, cos(a), sin(a)) + re^2 - rf^2 - |F1-E1|^2 == 0
+ * Optionally, factor the dot product:
+ *   re^2 - rf^2 + (F1-E1) . (2rf*(0, cos(a), sin(a)) - (F1-E1)) == 0
+ *
  * This is solved later in the testDir function.
  */
 
@@ -80,6 +94,7 @@
 #include "axisstepper.h"
 #include "linearstepper.h" //for LinearHomeStepper
 #include "iodrivers/endstop.h"
+#include "common/matrix.h"
 #include "common/logging.h"
 
 namespace motion {
@@ -98,17 +113,29 @@ enum DeltaAxis {
 template <typename StepperDriverT> class AngularDeltaStepper : public AxisStepperWithDriver<StepperDriverT> {
     DeltaAxis axisIdx;
     const iodrv::Endstop *endstop; //must be pointer, because cannot move a reference
+    // calibration settings from the CoordMap
     float e, f, re, rf, _zoffset;
     float w; //angle of this arm about the +z axis, in radians
-    float _DEGREES_STEP;
+    float _RADIANS_STEP;
 
-    float M0; //initial coordinate of THIS axis in degrees
+    float M0_rad; //initial coordinate of THIS axis in radians
     int sTotal; //current step offset from M0
 
+    Vector3f F1; //position of F1 joint in our YZ reference frame
+
     //variables used during linear motion
-    Vector3f line_P0; //initial cartesian position, in mm
-    Vector3f line_v; //cartesian velocity vector, in mm/sec
-    float DEGREES_STEP() const { return _DEGREES_STEP; } //number of degrees per step
+    Vector3f line_E1v; //velocity of the E1 point in our YZ reference frame
+    Vector3f line_E1_0; //initial position of the E1 point in our YZ reference frame at the start of the movement
+    float line_inverseVelocitySquared;
+
+    //variables used during arc motion
+    Vector3f arc_E1_0; //arc centerpoint (cartesian)
+    Vector3f arc_u, arc_v; //u and v vectors (cartesian); P(t) = Pc + u*cos(mt) + v*sin(mt)
+    float arc_rad; //radius of arc
+    float arc_m; //angular velocity of the arc.
+    bool isArcMotion;
+
+    float RADIANS_STEP() const { return _RADIANS_STEP; } //number of radians per step
     public:
         template <typename CoordMapT> AngularDeltaStepper(
             int idx, DeltaAxis axisIdx, const CoordMapT &map, const StepperDriverT &stepper, const iodrv::Endstop *endstop,
@@ -122,88 +149,173 @@ template <typename StepperDriverT> class AngularDeltaStepper : public AxisSteppe
            rf(rf),
            _zoffset(zoffset),
            w(axisIdx*2*M_PI/3), 
-           _DEGREES_STEP(map.DEGREES_STEP(axisIdx)) {
-              //E axis has to be controlled using a LinearStepper (as if it were cartesian)
+           _RADIANS_STEP(map.DEGREES_STEP(axisIdx) * M_PI / 180.0f) {
+              // E axis has to be controlled using a LinearStepper (as if it were cartesian)
               assert(axisIdx == ANGULARDELTA_AXIS_A || axisIdx == ANGULARDELTA_AXIS_B || axisIdx == ANGULARDELTA_AXIS_C);
+              // The location of F1 is fixed in our rotated reference frame
+              this->F1 = Vector3f(0, -f/(2*sqrtf(3.f)), _zoffset);
         }
 
         //function to initiate a linear (through cartesian space) motion
         template <typename CoordMapT, std::size_t sz> void beginLine(const CoordMapT &map, const std::array<int, sz>& curPos, 
         const Vector4f &vel) {
-            this->M0 = map.getAxisPosition(curPos, axisIdx)*map.DEGREES_STEP(axisIdx); 
+            this->M0_rad = map.getAxisPosition(curPos, axisIdx)*RADIANS_STEP(); 
             this->sTotal = 0;
-            this->line_P0 = map.xyzeFromMechanical(curPos).xyz();
-            this->line_v = vel.xyz();
             this->time = 0;
+            this->isArcMotion = false;
+            Vector3f line_P0 = map.xyzeFromMechanical(curPos).xyz();
+            Vector3f line_v = vel.xyz();
+
+            // rotate the cartesian position function into our flat YZ reference frame
+            auto rot = Matrix3x3::rotationAboutPositiveZ(-w);
+            this->line_E1v = rot.transform(line_v);
+            // line_P0 specifies the initial center of the effector; translate that into our rotated coordinate system
+            Vector3f E0_0 = rot.transform(line_P0);
+            // E1 is a fixed offset from E0
+            this->line_E1_0 = E0_0  + Vector3f(0, -e/(2*sqrt(3)), 0);
+            this->line_inverseVelocitySquared = 1.f / line_v.magSq();
         }
         //function to initiate a circular arc (through cartesian space) motion
         template <typename CoordMapT, std::size_t sz> void beginArc(const CoordMapT &map, const std::array<int, sz> &curPos, 
         const Vector3f &center, const Vector3f &u, const Vector3f &v,  
         float arcRad, float arcVel, float extVel) {
-            //arc motions not yet supported.
-            (void)map; (void)curPos; (void)center; (void)u; (void)v; (void)arcRad; (void)arcVel; (void)extVel; //unused
-            assert(false);
+            (void)extVel; //unused
+            this->M0_rad = map.getAxisPosition(curPos, axisIdx)*RADIANS_STEP(); 
+            this->sTotal = 0;
+            this->time = 0;
+            this->isArcMotion = true;
+
+            // rotate the cartesian position function into our flat YZ reference frame
+            auto rot = Matrix3x3::rotationAboutPositiveZ(-w);
+            this->arc_u = rot.transform(u);
+            this->arc_v = rot.transform(v);
+            Vector3f E0_0 = rot.transform(center);
+            // E1 is a fixed offset from E0
+            this->arc_E1_0 = E0_0  + Vector3f(0, -e/(2*sqrt(3)), 0);
+            this->arc_rad = arcRad;
+            this->arc_m = arcVel;
         }
 
         inline float testDir(float s) {
-            /*
-             * Given the constraint equations derived further up the page:
-             *    -(F1y-E1'y)cos(a) - (F1z-E1'z)sin(a) - 1/(2rf)*(re^2-E1x^2 - rf^2 - |F1-E1'|^2) == 0
-             * For linear motion, E1' = E1'o + E1'v*t and E1 = E1o + E1v*t
-             * Then -(F1y-E1'oy-E1'vy*t)cos(a) - (F1z-E1'oz-E1'vz*t)sin(a) - 1/(2rf)*(re^2-(E1ox+E1vx*t)^2 - rf^2 - |F1-E1'o-E1'v*t|^2) == 0
-             *
-             * We desire to test at what time t will a = D*RADIANS_STEP = (M0+s)*RADIANS_STEP
-             * Expand to separate the various powers of t:
-             *    -(F1y-E1'oy)cos(D) + E1'vy*t*cos(D) - (F1z-E1'oz)sin(D) + E1'vz*t*sin(D) - 1/(2rf)*(re^2 - (E1ox^2+2*E1ox*E1vx*t+E1vx^2*t^2) - rf^2 - (F1-E1'o-E1'v*t) . (F1-E1'o-E1'v*t)) == 0
-             * Multiply by 2rf & expand a little more
-             *    2rf( -(F1y-E1'oy)cos(D) + E1'vy*t*cos(D) - (F1z-E1'oz)sin(D) + E1'vz*t*sin(D) ) - re^2 + E1ox^2+2*E1ox*E1vx*t+E1vx^2*t^2 + rf^2 + (F1-E1'o) . (F1-E1'o) - 2(F1-E1'o) . E1'v*t + |E1'v*t|^2 == 0
-             * Group by t^0, t^1 and t^2
-             *    t^2 * (E1vx^2 + |E1'v|^2)
-                + t*(2rf*E1'vy*cos(D) + 2rf*E1'vz*sin(D) + 2*E1ox*E1vx - 2(F1-E1'o) . E1'v)
-                + -2rf(F1y-E1'oy)*cos(D) - 2rf(F1z-E1'oz)sin(D) - re^2 + E1ox^2 + rf^2 + (F1-E1'o) . (F1-E1'o) == 0
-             * This is a quadratic equation of t that we can solve using t = (-b +/- sqrt(b^2-4a*c)) / (2*a)
-             * There are two solutions; both may be valid, but have different meanings. 
-             *   If one solution is at a time in the past, then it's just a projection of the current path into the past. 
-             *   If both solutions are in the future, then pick the nearest one; 
-             *   it means that there are two points in this path where the arm angle should be the same.
-             */
-            // rotate everything by the angle of this axis so that we can do all calculations in the 'y-z' plane
-            auto rot = Matrix3x3::rotationAboutPositiveZ(-w);
-            auto E1v = rot.transform(line_v);
-            // The location of F1 is fixed in our rotated reference frame
-            Vector3f F1 = Vector3f(0, -f/(2*sqrt(3)), _zoffset);
-            // line_P0 specifies the initial center of the effector; translate that into our rotated coordinate system
-            Vector3f E0_0 = rot.transform(line_P0);
-            // E1 is a fixed offset from E0
-            Vector3f E1_0 = E0_0  + Vector3f(0, -e/(2*sqrt(3)), 0);
-            // E1' is the projection of E1 onto the y-z plane.
-            Vector3f E1prime0 = Vector3f(0, E1_0.y(), E1_0.z()); //initial E1' at the start of the move.
-            Vector3f E1primev = Vector3f(0, E1v.y(), E1v.z()); // movement of E1' (which is restricted to our plane)
-            // determine the queried angle of our arm, in radians
-            float angle = (M0+s) * M_PI / 180.0;
-            // determine the coefficients to at^2 + bt + c = 0, which gives the time at which our arm will be at the above angle (possibly non-existant).
-            float a = E1v.x()*E1v.x() + E1primev.magSq();
-            float b = 2*rf*E1primev.y()*cos(angle) + 2*rf*E1primev.z()*sin(angle)  + 2*E1_0.x()*E1v.x() - 2*(F1-E1prime0).dot(E1primev);
-            float c = -2*rf*(F1.y()-E1prime0.y())*cos(angle) - 2*rf*(F1.z()-E1prime0.z())*sin(angle) - re*re  + E1_0.x()*E1_0.x() + rf*rf + (F1-E1prime0).magSq();
+            if (isArcMotion) {
+                /*
+                 * Given the constraint equations derived further up the page:
+                 *   2rf*(F1-E1) . (0, cos(a), sin(a)) + re^2 - rf^2 - |F1-E1|^2 == 0
+                 * For circular motion, E1 = E1o + s*cos(m*t)u + s*sin(m*t)v
+                 *   where s is the radius of the curve, u and v are two perpindicular vectors from the curve center to its edge,
+                 * We desire to test at what time t will a = D*RADIANS_STEP = (M0+s)*RADIANS_STEP
+                 *   0 == 2rf*(F1 - E1o - s*cos(m*t)u - s*sin(m*t)v) . (0, cos(a), sin(a)) + re^2 - rf^2 - |(F1 - E1o) - s*cos(m*t)u - s*sin(m*t)v|^2
+                 * Substitute:
+                 *   0 == 2rf*[(F1y-E1'oy)cos(a) + (F1z-E1'oz)sin(a) - s*uy*cos(m*t)*cos(a) - s*vy*sin(m*t)*cos(a) - s*uz*cos(m*t)*sin(a) - s*vz*sin(m*t)*sin(a)] + re^2 - rf^2 - [|F1-E1o|^2 + s^2*cos(m*t)^2|u|^2 + s^2*sin(m*t)^2|v|^2 - 2*(F1-E1o) . s*cos(m*t)u - 2*(F1-E1o) . s*sin(m*t)v + s^2*cos(m*t)sin(m*t)*u . v]
+                 * u and v are perpindicular, therefore u . v = 0
+                 * also |u|=1 and |v|=1
+                 *   0 == 2rf*[(F1y-E1'oy)cos(a) + (F1z-E1'oz)sin(a) - s*uy*cos(m*t)*cos(a) - s*vy*sin(m*t)*cos(a) - s*uz*cos(m*t)*sin(a) - s*vz*sin(m*t)*sin(a)] + re^2 - rf^2 - [|F1-E1o|^2 + s^2 - 2*(F1-E1o) . s*cos(m*t)u - 2*(F1-E1o) . s*sin(m*t)v]
+                 * Expand to separate the cos(m*t) from the sin(m*t):
+                 *   0 == 2rf*[(F1y-E1'oy)cos(a) + (F1z-E1'oz)sin(a)] - 2rf*s*uy*cos(m*t)*cos(a) - 2rf*s*vy*sin(m*t)*cos(a) - 2rf*s*uz*cos(m*t)*sin(a) - 2rf*s*vz*sin(m*t)*sin(a) + re^2 - rf^2 - |F1-E1o|^2 - s^2 + 2*(F1-E1o) . s*cos(m*t)u + 2*(F1-E1o) . s*sin(m*t)v
+                 * Group the cos(m*t), sin(m*t) and constant terms:
+                 *   0 == 2rf*[(F1y-E1'oy)cos(a) + (F1z-E1'oz)sin(a)] + re^2 - rf^2 - |F1-E1o|^2 - s^2
+                 *     + cos(m*t)*[ - 2rf*s*uy*cos(a) - 2rf*s*uz*sin(a) + 2*(F1-E1o) . s*u]
+                 *     + sin(m*t)*[ - 2rf*s*vy*cos(a) - 2rf*s*vz*sin(a) + 2*(F1-E1o) . s*v]
+                 *
+                 * Now we can use the identity: {m,n,p} . {Sin[q], Cos[q], 1} == 0 has solutions of:
+                 *        q = arctan((-n*p - m*sqrt(m*m+n*n-p*p))/(m*m+n*n),  (-m*p + n*sqrt(m*m+n*n-p*p))/(m*m + n*n)  )  where arctan(x, y) = atan(y/x)
+                 *     OR q = arctan((-n*p + m*sqrt(m*m+n*n-p*p))/(m*m+n*n),  (-m*p - n*sqrt(m*m+n*n-p*p))/(m*m + n*n)  )
+                 */
+                // determine the queried angle of our arm, in radians
+                float angle = M0_rad+s;
+                float sinAngle = sinf(angle);
+                float cosAngle = cosf(angle);
+                Vector3f E1_0 = arc_E1_0;
+                Vector3f u = arc_u;
+                Vector3f v = arc_v;
+                // sin(m*t)*[ - 2rf*s*vy*cos(a) - 2rf*s*vz*sin(a) + 2*(F1-E1o) . s*v]
+                float m = -2*rf*arc_rad*v.dot(0, cosAngle, sinAngle) + 2*arc_rad*(F1-E1_0).dot(v);
+                // cos(m*t)*[ - 2rf*s*uy*cos(a) - 2rf*s*uz*sin(a) + 2*(F1-E1o) . s*u]
+                float n = -2*rf*arc_rad*u.dot(0, cosAngle, sinAngle) + 2*arc_rad*(F1-E1_0).dot(u);
+                // 2rf*[(F1y-E1'oy)cos(a) + (F1z-E1'oz)sin(a)] + re^2 - rf^2 - |F1-E1o|^2 - s^2*|u|^2
+                float p = 2*rf*(F1-E1_0).dot(0, cosAngle, sinAngle) + re*re - rf*rf - (F1-E1_0).magSq() - arc_rad*arc_rad;
 
-            // Solve the quadratic equation: x = (-b +/- sqrt(b^2-4ac)) / (2a)
-            float term1 = -b;
-            float rootParam = (b*b-4*a*c);
-            float divisor = 2*a;
-            //check if the sqrt argument is negative
-            //TODO: can it ever be negative?
-            if (rootParam < 0) {
-                return NAN;
-            }
-            float root = std::sqrt(rootParam);
-            float t1 = (term1 - root)/divisor;
-            float t2 = (term1 + root)/divisor;
-            //return the nearest of the two times that is > current time.
-            if (root > term1) { //if this is true, then t1 MUST be negative.
-                //return t2 if t2 > last_step_time else None
-                return t2 > this->time ? t2 : NAN;
+                // solve {m,n,p} . {Sin[q], Cos[q], 1} == 0:
+                float mt_1 = atan2f((-m*p + n*sqrtf(m*m+n*n-p*p))/(m*m + n*n), (-n*p - m*sqrtf(m*m+n*n-p*p))/(m*m+n*n));
+                float mt_2 = atan2f((-m*p - n*sqrtf(m*m+n*n-p*p))/(m*m + n*n), (-n*p + m*sqrtf(m*m+n*n-p*p))/(m*m+n*n));
+                float t1 = mt_1/this->arc_m;
+                float t2 = mt_2/this->arc_m;
+                //two possible solutions; choose the NEAREST one that is not in the past:
+                //TODO: are solutions to mt = x +/- c*2*pi?
+                if (t1 < this->time && t2 < this->time) { return NAN; }
+                else if (t1 < this->time) { return t2; }
+                else if (t2 < this->time) { return t1; }
+                else { return std::min(t1, t2); }
             } else {
-                return t1 > this->time ? t1 : (t2 > this->time ? t2 : NAN); //ensure no value < time is returned.
+                /*
+                 * Given the constraint equations derived further up the page:
+                 *    -(F1y-E1'y)cos(a) - (F1z-E1'z)sin(a) - 1/(2rf)*(re^2-E1x^2 - rf^2 - |F1-E1'|^2) == 0
+                 * For linear motion, E1' = E1'o + E1'v*t and E1 = E1o + E1v*t
+                 * Then -(F1y-E1'oy-E1'vy*t)cos(a) - (F1z-E1'oz-E1'vz*t)sin(a) - 1/(2rf)*(re^2-(E1ox+E1vx*t)^2 - rf^2 - |F1-E1'o-E1'v*t|^2) == 0
+                 *
+                 * We desire to test at what time t will a = D*RADIANS_STEP = (M0+s)*RADIANS_STEP
+                 * Expand to separate the various powers of t:
+                 *    -(F1y-E1'oy)cos(D) + E1'vy*t*cos(D) - (F1z-E1'oz)sin(D) + E1'vz*t*sin(D) - 1/(2rf)*(re^2 - (E1ox^2+2*E1ox*E1vx*t+E1vx^2*t^2) - rf^2 - (F1-E1'o-E1'v*t) . (F1-E1'o-E1'v*t)) == 0
+                 * Multiply by 2rf & expand a little more
+                 *    2rf( -(F1y-E1'oy)cos(D) + E1'vy*t*cos(D) - (F1z-E1'oz)sin(D) + E1'vz*t*sin(D) ) - re^2 + E1ox^2+2*E1ox*E1vx*t+E1vx^2*t^2 + rf^2 + (F1-E1'o) . (F1-E1'o) - 2(F1-E1'o) . E1'v*t + |E1'v*t|^2 == 0
+                 * Group by t^0, t^1 and t^2
+                 *    t^2 * (E1vx^2 + |E1'v|^2)
+                    + t*(2rf*E1'vy*cos(D) + 2rf*E1'vz*sin(D) + 2*E1ox*E1vx - 2(F1-E1'o) . E1'v)
+                    + -2rf(F1y-E1'oy)*cos(D) - 2rf(F1z-E1'oz)sin(D) - re^2 + E1ox^2 + rf^2 + (F1-E1'o) . (F1-E1'o) == 0
+                 * This is a quadratic equation of t that we can solve using t = (-b +/- sqrt(b^2-4a*c)) / (2*a)
+                 * There are two solutions; both may be valid, but have different meanings. 
+                 *   If one solution is at a time in the past, then it's just a projection of the current path into the past. 
+                 *   If both solutions are in the future, then pick the nearest one; 
+                 *   it means that there are two points in this path where the arm angle should be the same.
+                 */
+                
+                Vector3f E1v = line_E1v;
+                Vector3f E1_0 = line_E1_0;
+                // determine the queried angle of our arm, in radians
+                float angle = M0_rad+s;
+                float sinAngle = sinf(angle);
+                float cosAngle = cosf(angle);
+                
+                // determine the coefficients to at^2 + bt + c = 0, which gives the time at which our arm will be at the above angle (possibly non-existant).
+                // unoptimized (preserve for reference)
+                // float a = E1v.x()*E1v.x() + E1primev.magSq();
+                // float b = 2*(rf*E1primev.y()*cos(angle) + rf*E1primev.z()*sin(angle)  + E1_0.x()*E1v.x() - (F1-E1prime0).dot(E1primev));
+                // float c = -2*rf*(F1.y()-E1prime0.y())*cosAngle - 2*rf*(F1.z()-E1prime0.z())*sinAngle - re*re  + E1_0.x()*E1_0.x() + rf*rf + (F1-E1prime0).magSq();
+                
+                // More efficient implementation than the above
+                // cache the inverse of a to avoid a float division
+                float inv_a = line_inverseVelocitySquared;
+                // calculate only b/(2*a) (see below for explanation)
+                // float b_2a = inv_a*(rf*E1primev.y()*cosAngle + rf*E1primev.z()*sinAngle  + E1_0.x()*E1v.x() - (F1-E1prime0).dot(E1primev));
+                float b_2a = inv_a*(rf*E1v.y()*cosAngle + rf*E1v.z()*sinAngle  - (F1-E1_0).dot(E1v));
+                // calculate only c/a (see below for explanation)
+                // float c_a = inv_a*(-2*rf*(F1.y()-E1prime0.y())*cosAngle - 2*rf*(F1.z()-E1prime0.z())*sinAngle - re*re  + E1_0.x()*E1_0.x() + rf*rf + (F1-E1prime0).magSq());
+                float c_a = inv_a*(-2*rf*(F1.y()-E1_0.y())*cosAngle - 2*rf*(F1.z()-E1_0.z())*sinAngle - re*re  + rf*rf + (F1-E1_0).magSq());
+
+                // Solve the quadratic equation: x = (-b +/- sqrt(b^2-4ac)) / (2a)
+                // Note: if we divide numerator and denominator by 2, we get:
+                //   x = (-b/2 +/- sqrt((b/2)^2-ac)) / a, which is slightly easier to compute given that our b has a factor of 2.
+                // also, divide top and bottom by a, and we get:
+                //   x = -b/a/2 +/- sqrt((b/a/2)^2-c/a)
+                // we can do that because a is guaranteed to be positive, since it is the square of the velocity
+                float term1 = -b_2a;
+                float rootParam = b_2a*b_2a - c_a;
+                //check if the sqrt argument is negative
+                //TODO: can it ever be negative?
+                if (rootParam < 0) {
+                    return NAN;
+                }
+                float root = sqrtf(rootParam);
+                float t1 = term1 - root;
+                float t2 = term1 + root;
+                //return the nearest of the two times that is > current time.
+                //note: root will always be positive.
+                if (root > term1) { //if this is true, then t1 MUST be negative.
+                    //return t2 if t2 > last_step_time else None
+                    return t2 > this->time ? t2 : NAN;
+                } else {
+                    return t1 > this->time ? t1 : (t2 > this->time ? t2 : NAN); //ensure no value < time is returned.
+                }
             }
         }
     
@@ -217,8 +329,8 @@ template <typename StepperDriverT> class AngularDeltaStepper : public AxisSteppe
             if (useEndstops && endstop->isEndstopTriggered()) {
                 this->time = NAN; //at endstop; no more steps.
             } else {
-                float negTime = testDir((this->sTotal-1)*DEGREES_STEP()); //get the time at which next steps would occur.
-                float posTime = testDir((this->sTotal+1)*DEGREES_STEP());
+                float negTime = testDir((this->sTotal-1)*RADIANS_STEP()); //get the time at which next steps would occur.
+                float posTime = testDir((this->sTotal+1)*RADIANS_STEP());
                 if (negTime < this->time || std::isnan(negTime)) { //negTime is invalid
                     if (posTime > this->time) {
                         LOGV("LinearDeltaStepper<%u>::chose %f (pos) vs %f (neg)\n", axisIdx, posTime, negTime);
